@@ -44,6 +44,8 @@ class AdbConnectPort(
     /** 开始、结束扫本机端口时各报一次(界面显示「正在本机查找…」)。 */
     private val scanning: (Boolean) -> Unit = {},
     private val localHost: String = LOCALHOST,
+    /** 除 [localHost] 外还要试的本机地址(如 Wi-Fi / VPN 网卡的 IPv4);有的机型 adbd 在回环上不认已配对钥匙,换本机网卡地址才能连上。 */
+    private val moreHosts: () -> List<String> = { emptyList() },
 ) {
     /** 用 [open] 依次试候选,返回第一个连上的结果;一个都连不上时抛 CONNECT_FAILED。 */
     suspend fun <T> connect(open: (host: String, port: Int) -> T): T {
@@ -52,7 +54,9 @@ class AdbConnectPort(
         var last: AdbConnectionException? = null
         val manualPort = manual()?.takeIf { it in 1..65535 }
         var scanResult: ScanResult? = null
-        fun local(vararg ports: Int?) = ports.filterNotNull().map { AdbEndpoint(localHost, it) }
+        fun local(vararg ports: Int?) = ports.filterNotNull().flatMap { p ->
+            (listOf(localHost) + moreHosts()).distinct().map { AdbEndpoint(it, p) }
+        }
         val sources: List<suspend () -> List<AdbEndpoint>> = listOf(
             { local(cache.load()) },
             { local(property()) },
@@ -88,7 +92,7 @@ class AdbConnectPort(
                     try {
                         return open(ep.host, ep.port).also { cache.save(ep.port); connected = true }
                     } catch (e: AdbConnectionException) {
-                        if (e.reason == AdbConnectionException.Reason.UNAUTHORIZED) throw e
+                        // 不再一遇 UNAUTHORIZED 就放弃:回环地址被拒、但同一把钥匙在本机网卡地址上可能被接受,先都试一遍再决定。
                         last = e
                     }
                 }

@@ -13,8 +13,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.provider.Settings
+import android.util.Log
 import com.wangzan101.mika.core.adb.AdbConnectPort
 import com.wangzan101.mika.core.adb.AdbConnection
+import com.wangzan101.mika.core.adb.AdbConnectionException
 import com.wangzan101.mika.core.adb.ConnectCandidates
 import com.wangzan101.mika.core.adb.AdbPairing
 import com.wangzan101.mika.core.adb.AdbServiceTypes
@@ -44,7 +46,10 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicReference
+
+private const val TAG = "MikaShell"
 
 /**
  * 内置助手的真实现:配对、经本机 adbd 起助手、看门狗。由 [com.wangzan101.mika.cap.phone.PhoneServices] 建一份,
@@ -130,6 +135,7 @@ class BuiltinShellManager(context: Context, private val hub: HelperHub, private 
         private val scan = LocalPortScan(NioPortScanner(), ::localHosts, { LocalPortScan.parseRange(portRangeText()) })
         private val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         private val finder = NsdAdbServiceFinder(app)
+        private var lastCandidates: ConnectCandidates? = null
         private val portCache = object : PortCache {
             override fun load() = prefs.getInt("port", 0).takeIf { it > 0 }
             override fun save(port: Int) { prefs.edit().putInt("port", port).apply() }
@@ -154,7 +160,19 @@ class BuiltinShellManager(context: Context, private val hub: HelperHub, private 
         override suspend fun findPairingPort(timeoutMs: Long): Int? = finder.findPorts(AdbServiceTypes.PAIRING, timeoutMs).firstOrNull()
 
         override fun pair(port: Int, code: String) {
-            AdbPairing(AndroidAdb.tls(AndroidAdb.identity(app))).pair(LOCALHOST, port, code)
+            // 配对服务也可能只绑在 VPN/其它本机网卡上,逐个本机地址试,不再只认 127.0.0.1。
+            val tls = AndroidAdb.tls(AndroidAdb.identity(app))
+            var last: Exception? = null
+            for (host in localHosts()) {
+                try {
+                    AdbPairing(tls).pair(host, port, code)
+                    return
+                } catch (e: Exception) {
+                    last = e
+                    Log.w(TAG, "pair via " + host + ":" + port + " failed: " + e.message)
+                }
+            }
+            throw last ?: IllegalStateException("no local address to pair over")
         }
 
         override suspend fun launchHelper() {
@@ -175,18 +193,38 @@ class BuiltinShellManager(context: Context, private val hub: HelperHub, private 
         }
 
         suspend fun connect(tls: AdbTls = AndroidAdb.tls(AndroidAdb.identity(app))): AdbConnection =
-            AdbConnectPort(
-                ::tlsPort, finder, portCache, report = candidates, scan = scan, manual = { manualPort.getAndSet(null) }, scanning = scanning,
-            ).connect { host, port -> AdbConnection.open(host, port, tls) }
+            try {
+                AdbConnectPort(
+                    ::tlsPort, finder, portCache, report = { c -> lastCandidates = c; candidates(c) }, scan = scan, manual = { manualPort.getAndSet(null) }, scanning = scanning,
+                    moreHosts = { localHosts().filter { it != LOCALHOST } },
+                ).connect { host, port -> AdbConnection.open(host, port, tls) }
+            } catch (e: AdbConnectionException) {
+                Log.w(TAG, "connect failed: " + e.reason + " " + e.message + "; candidates=" + lastCandidates)
+                throw e
+            }
 
-        /** 扫端口时只扫本机自己:127.0.0.1 和 Wi-Fi 上的 IPv4 地址。 */
-        private fun localHosts(): List<String> = listOf(LOCALHOST) + runCatching {
-            val cm = app.getSystemService(ConnectivityManager::class.java)
-            @Suppress("DEPRECATION")
-            cm.allNetworks.filter { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
-                .flatMap { cm.getLinkProperties(it)?.linkAddresses.orEmpty() }
-                .mapNotNull { (it.address as? Inet4Address)?.hostAddress }
-        }.getOrDefault(emptyList())
+        /**
+         * 本机自己的 IPv4 地址,127.0.0.1 排在最前。
+         * 必须包含所有本地网卡,而不只是 Wi-Fi:开着 VPN 时 adbd 的「无线调试」可能只绑在 VPN 网卡
+         * (如 tun 的 172.19.0.1)上,此时只连 127.0.0.1 会连不上,配对和起助手都会失败。
+         */
+        private fun localHosts(): List<String> {
+            val hosts = LinkedHashSet<String>()
+            hosts += LOCALHOST
+            runCatching {
+                val cm = app.getSystemService(ConnectivityManager::class.java)
+                @Suppress("DEPRECATION")
+                cm.allNetworks.flatMap { cm.getLinkProperties(it)?.linkAddresses.orEmpty() }
+                    .mapNotNull { (it.address as? Inet4Address)?.hostAddress }
+                    .forEach { hosts += it }
+            }
+            runCatching {
+                NetworkInterface.getNetworkInterfaces().toList().filter { it.isUp && !it.isLoopback }
+                    .flatMap { it.interfaceAddresses }.mapNotNull { (it.address as? Inet4Address)?.hostAddress }
+                    .forEach { hosts += it }
+            }
+            return hosts.toList()
+        }
 
         /** 系统分配临时端口的范围;有的系统不让 App 读,读不到就扫默认的一段。 */
         private fun portRangeText(): String? = runCatching { File(PORT_RANGE_FILE).readText() }.getOrNull()

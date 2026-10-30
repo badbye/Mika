@@ -63,15 +63,47 @@ class AdbConnectPortTest {
         assertEquals(listOf(4000, 6000), attempts)
     }
 
+    /** UNAUTHORIZED 不再立即中断:同一把钥匙在别的地址/端口上仍可能被接受(见下方的本机地址回退测试)。 */
     @Test
-    fun unauthorizedStopsTheChain() = runTest {
+    fun unauthorizedDoesNotAbortTheChain() = runTest {
+        assertEquals("conn@5000", chain(4000, 5000, Cache(3000)).connect(opener(5000, 6000, unauthorized = 4000)))
+        assertEquals(listOf(3000, 4000, 5000), attempts)
+    }
+
+    /**
+     * 荣耀等机型的坑:adbd 在回环 127.0.0.1 上不认已配对的钥匙(TLS 握手后直接断开 -> UNAUTHORIZED),
+     * 但同一把钥匙在本机网卡地址(如 Wi-Fi/VPN 的 IPv4)上能被接受。给 [AdbConnectPort.moreHosts]
+     * 传入本机网卡地址后,同一个端口会在这些地址上各试一次,回环被拒也能连上。
+     */
+    @Test
+    fun unauthorizedOnLoopbackFallsBackToLocalInterfaceAddresses() = runTest {
+        val hostsTried = mutableListOf<String>()
+        val port = AdbConnectPort(
+            { 4000 }, { _, _ -> emptyList() }, Cache(),
+            moreHosts = { listOf("192.0.2.10") },
+        )
+        val result = port.connect { host, p ->
+            hostsTried += host
+            if (host == "127.0.0.1") throw AdbConnectionException(Reason.UNAUTHORIZED, "denied on loopback")
+            "conn@$host:$p"
+        }
+        assertEquals("conn@192.0.2.10:4000", result)
+        assertEquals(listOf("127.0.0.1", "192.0.2.10"), hostsTried)
+    }
+
+    /** 所有地址都拒绝钥匙时,最终仍以 UNAUTHORIZED 结束(界面据此提示重新配对)。 */
+    @Test
+    fun allHostsUnauthorizedStaysUnauthorized() = runTest {
+        val port = AdbConnectPort(
+            { 4000 }, { _, _ -> emptyList() }, Cache(),
+            moreHosts = { listOf("192.0.2.10") },
+        )
         try {
-            chain(4000, 5000, Cache(3000)).connect(opener(5000, 6000, unauthorized = 4000))
+            port.connect { _, _ -> throw AdbConnectionException(Reason.UNAUTHORIZED, "no") }
             fail("expected UNAUTHORIZED")
         } catch (e: AdbConnectionException) {
             assertEquals(Reason.UNAUTHORIZED, e.reason)
         }
-        assertEquals(listOf(3000, 4000), attempts)
     }
 
     @Test
